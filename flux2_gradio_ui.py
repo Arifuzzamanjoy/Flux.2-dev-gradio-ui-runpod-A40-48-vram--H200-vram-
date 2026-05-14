@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Tuple, Generator
 import gradio as gr
 from diffusers import FluxPipeline, Flux2Pipeline, Flux2Transformer2DModel, AutoencoderKL, FlowMatchEulerDiscreteScheduler
 from transformers import T5EncoderModel, T5TokenizerFast, CLIPTextModel, CLIPTokenizer
-from huggingface_hub import login, get_token
+from huggingface_hub import login, get_token, InferenceClient
 import requests
 from dotenv import load_dotenv
 from datetime import datetime
@@ -135,9 +135,36 @@ torch.cuda.empty_cache()
 import gc
 gc.collect()
 
-# Use bfloat16 for better performance on newer GPUs
-dtype = torch.bfloat16
+# Use full precision for FLUX.2 and rely on CPU offload when memory pressure is high
+dtype = torch.float32
 device = "cuda" if torch.cuda.is_available() else "cpu"
+USE_CPU_OFFLOAD = True
+MAX_VLM_IMAGES = 3
+VLM_MODEL = "baidu/ERNIE-4.5-VL-424B-A47B-Base-PT"
+
+SYSTEM_PROMPT_TEXT_ONLY = """You are an expert prompt engineer for FLUX.2 by Black Forest Labs. Rewrite user prompts to be more descriptive while strictly preserving their core subject and intent.
+
+Guidelines:
+1. Structure: Keep structured inputs structured (enhance within fields). Convert natural language to detailed paragraphs.
+2. Details: Add concrete visual specifics - form, scale, textures, materials, lighting (quality, direction, color), shadows, spatial relationships, and environmental context.
+3. Text in Images: Put ALL text in quotation marks, matching the prompt's language. Always provide explicit quoted text for objects that would contain text in reality (signs, labels, screens, etc.) - without it, the model generates gibberish.
+
+Output only the revised prompt and nothing else."""
+
+SYSTEM_PROMPT_WITH_IMAGES = """You are FLUX.2 by Black Forest Labs, an image-editing expert. You convert editing requests into one concise instruction (50-80 words, ~30 for brief requests).
+
+Rules:
+- Single instruction only, no commentary
+- Use clear, analytical language (avoid "whimsical," "cascading," etc.)
+- Specify what changes AND what stays the same (face, lighting, composition)
+- Reference actual image elements
+- Turn negatives into positives ("don't change X" → "keep X")
+- Make abstractions concrete ("futuristic" → "glowing cyan neon, metallic panels")
+- Keep content PG-13
+
+Output only the final instruction in plain text and nothing else."""
+
+hf_client = InferenceClient(api_key=os.environ.get("HF_TOKEN"))
 
 # Check available GPU memory
 if torch.cuda.is_available():
@@ -149,8 +176,8 @@ print("🔄 Loading models, please wait...")
 # Note: FLUX.2-dev includes its own text encoder built-in
 # No need for external text encoders or API calls
 
-# Load required models (only for fallback to FLUX.1-dev)
-# These are commented out initially to save memory - will be loaded only if FLUX.2 4-bit fails
+# Keep these placeholders for compatibility with older code paths; FLUX.2 uses its built-in text encoder
+# and the main runtime now loads in full precision with CPU offload when needed.
 text_encoder = None
 tokenizer = None
 vae = None
@@ -161,100 +188,30 @@ scheduler = FlowMatchEulerDiscreteScheduler()
 print("🔄 Loading the pipeline, please wait...")
 
 # Initialize the FLUX.2-dev pipeline
-# Load FLUX.2-dev with 4-bit quantization to save memory
+# Prefer full precision loading; use CPU offload to keep auxiliary components off VRAM when needed
 try:
-    # Use 4-bit quantized model (much less memory)
-    repo_id = "diffusers/FLUX.2-dev-bnb-4bit"
-    
-    print("🔄 Loading FLUX.2 with 4-bit quantization (saves memory)...")
+    repo_id = "black-forest-labs/FLUX.2-dev"
+
+    print("🔄 Loading FLUX.2-dev in full precision...")
     pipe = Flux2Pipeline.from_pretrained(
-        
-    
         repo_id,
         torch_dtype=dtype,
+        low_cpu_mem_usage=True,
         cache_dir=os.environ["HF_HOME"]
     )
-    print("✅ Loaded FLUX.2-dev with 4-bit quantization successfully")
-    print("✅ Using FLUX.2-dev's built-in text encoder (no external API needed)")
+    print("✅ Loaded FLUX.2-dev successfully in full precision")
+
+    if torch.cuda.is_available() and USE_CPU_OFFLOAD:
+        try:
+            pipe.enable_model_cpu_offload()
+            print("✅ Enabled model CPU offload for non-active FLUX.2 components")
+        except Exception as offload_error:
+            print(f"⚠️ Could not enable model CPU offload: {offload_error}")
+            pipe.to(device)
+    else:
+        pipe.to(device)
 except Exception as e:
-    print(f"⚠️ Could not load FLUX.2-dev 4-bit, trying full FLUX.2-dev: {e}")
-    try:
-        repo_id = "black-forest-labs/FLUX.2-dev"
-        
-        print("🔄 Loading FLUX.2 transformer...")
-        dit = Flux2Transformer2DModel.from_pretrained(
-            repo_id,
-            subfolder="transformer",
-            torch_dtype=dtype,
-            cache_dir=os.environ["HF_HOME"]
-        )
-        
-        print("🔄 Loading FLUX.2 pipeline...")
-        pipe = Flux2Pipeline.from_pretrained(
-            repo_id,
-            text_encoder=None,  # Will use remote text encoder
-            transformer=dit,
-            torch_dtype=dtype,
-            cache_dir=os.environ["HF_HOME"]
-        )
-        print("✅ Loaded full FLUX.2-dev successfully")
-    except Exception as e2:
-        print(f"⚠️ Could not load FLUX.2-dev, falling back to FLUX.1-dev: {e2}")
-        print("🔄 Loading models for FLUX.1-dev fallback...")
-        
-        # Load models only for fallback
-        text_encoder = CLIPTextModel.from_pretrained(
-            "openai/clip-vit-large-patch14-336", 
-            torch_dtype=dtype, 
-            cache_dir=os.environ["HF_HOME"]
-        ).to(device)
-        
-        tokenizer = CLIPTokenizer.from_pretrained(
-            "openai/clip-vit-large-patch14-336", 
-            cache_dir=os.environ["HF_HOME"]
-        )
-        
-        vae = AutoencoderKL.from_pretrained(
-            "black-forest-labs/FLUX.1-dev", 
-            subfolder="vae", 
-            torch_dtype=dtype, 
-            cache_dir=os.environ["HF_HOME"]
-        ).to(device)
-        
-        text_encoder_2 = T5EncoderModel.from_pretrained(
-            "google/t5-v1_1-xxl", 
-            torch_dtype=dtype, 
-            cache_dir=os.environ["HF_HOME"]
-        ).to(device)
-        
-        tokenizer_2 = T5TokenizerFast.from_pretrained(
-            "google/t5-v1_1-xxl", 
-            legacy=True, 
-            cache_dir=os.environ["HF_HOME"]
-        )
-        
-        # Fallback to FLUX.1-dev
-        pipe = FluxPipeline.from_pretrained(
-            "black-forest-labs/FLUX.1-dev",
-            vae=vae,
-            text_encoder=text_encoder,
-            tokenizer=tokenizer,
-            text_encoder_2=text_encoder_2,
-            tokenizer_2=tokenizer_2,
-            torch_dtype=dtype,
-            scheduler=scheduler,
-            cache_dir=os.environ["HF_HOME"]
-        )
-        print("✅ Loaded FLUX.1-dev as fallback")
-
-
-
-###############
-
-
-####################
-# Move to GPU
-pipe.to(device)
+    raise RuntimeError(f"Could not load FLUX.2-dev in full precision: {e}") from e
 
 # Optimize memory usage
 try:
@@ -264,6 +221,46 @@ except Exception:
     print("⚠️ xformers not available. Using default attention mechanism.")
 
 print("✅ Model loaded and ready")
+
+
+def image_to_data_uri(img: Image.Image) -> str:
+    buffered = io.BytesIO()
+    img.save(buffered, format="PNG")
+    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{img_str}"
+
+
+def refine_prompt_with_vlm(prompt: str, image_list: Optional[List[Image.Image]] = None) -> str:
+    """Use a multimodal model to refine the prompt before FLUX.2 generation."""
+    try:
+        images = (image_list or [])[:MAX_VLM_IMAGES]
+        if images:
+            user_content = [{"type": "text", "text": prompt}]
+            for img in images:
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": image_to_data_uri(img)}
+                })
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT_WITH_IMAGES},
+                {"role": "user", "content": user_content},
+            ]
+        else:
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT_TEXT_ONLY},
+                {"role": "user", "content": prompt},
+            ]
+
+        completion = hf_client.chat.completions.create(
+            model=VLM_MODEL,
+            messages=messages,
+            max_tokens=1024,
+        )
+        refined = completion.choices[0].message.content.strip()
+        return refined or prompt
+    except Exception as e:
+        logger.warning(f"Prompt refinement failed, using original prompt: {e}")
+        return prompt
 
 # Watermark and branding functionality
 def add_watermark(image: Image.Image, text: str = f"{APP_NAME} v{APP_VERSION}") -> Image.Image:
@@ -593,7 +590,7 @@ def generate_image(
     if seed == -1:
         seed = random.randint(0, 2147483647)
     
-    generator = torch.Generator("cuda").manual_seed(seed)
+    generator = torch.Generator(device=device).manual_seed(seed)
     
     # Configure optimal parameters for runpod
     safe_width = (width // 16) * 16  # Ensure width is divisible by 16
@@ -793,7 +790,7 @@ def generate_images_from_file(
             # Generate a random seed for each image
             seed = random.randint(0, 2147483647)
             seeds_used.append(seed)
-            generator = torch.Generator("cuda").manual_seed(seed)
+            generator = torch.Generator(device=device).manual_seed(seed)
             
             # Configure optimal parameters
             safe_width = (width // 16) * 16
@@ -1009,8 +1006,8 @@ def manage_lora_visibility(selected_lora, action):
 
 def generate_with_enhanced_features(
     prompt, width, height, steps, guidance_scale, seed,
-    lora_dropdown, custom_lora_path, lora_scale, num_images, 
-    input_image_1, input_image_2, input_image_3
+    lora_dropdown, custom_lora_path, lora_scale, num_images,
+    prompt_upsampling, input_image_1, input_image_2, input_image_3
 ):
     """Enhanced wrapper function with validation, progress tracking, and professional features"""
     add_watermark_flag = False  # No watermark needed
@@ -1034,6 +1031,13 @@ def generate_with_enhanced_features(
         else:
             _, models = get_filtered_lora_choices()
             final_lora_path = get_lora_path_from_choice(lora_dropdown, models)
+
+        if prompt_upsampling:
+            reference_images = []
+            for image_path in (input_image_1, input_image_2, input_image_3):
+                if image_path:
+                    reference_images.append(Image.open(image_path).convert("RGB"))
+            prompt = refine_prompt_with_vlm(prompt, reference_images)
         
         # Start generation
         start_time = time.time()
@@ -1436,6 +1440,12 @@ with gr.Blocks(title=f"{APP_NAME} v{APP_VERSION}") as demo:
                     placeholder="Describe your vision in detail... (3-2000 characters)",
                     lines=4
                 )
+
+                prompt_upsampling = gr.Checkbox(
+                    label="🧠 Use VLM Prompt Refinement",
+                    value=True,
+                    info="Rewrite the prompt with a multimodal model before generation"
+                )
                 
                 # FLUX.2-dev Multi-Image Input (NEW FEATURE - Separate & Identifiable)
                 with gr.Accordion("🖼️ Input Images (FLUX.2 Multi-Image)", open=False):
@@ -1752,8 +1762,9 @@ with gr.Blocks(title=f"{APP_NAME} v{APP_VERSION}") as demo:
                 * **Dimensions**: Use multiples of 64 for optimal results, standard sizes: 512x512, 768x768, 1024x1024
                 
                 ### 🚀 FLUX.2-Specific Features
-                * **Advanced Architecture**: FLUX.2-dev uses improved 4-bit quantization for faster generation
-                * **Remote Text Encoding**: Leverages cloud-based text encoder for enhanced prompt understanding
+                * **Full Precision Runtime**: FLUX.2-dev loads in `float32` for maximum fidelity
+                * **CPU Offload Support**: Heavy modules can stay on CPU until they are needed
+                * **Built-In Text Encoding**: Uses the pipeline's native text encoder path
                 * **Multi-Image Input**: Can accept multiple reference images for context and guidance
                 * **No Negative Prompts**: FLUX.2 works best with positive descriptions only
                 * **Quality Control**: Build quality requirements into your positive prompt
@@ -1843,9 +1854,9 @@ with gr.Blocks(title=f"{APP_NAME} v{APP_VERSION}") as demo:
                 * **Application**: {APP_NAME}
                 * **Version**: {APP_VERSION}
                 * **License**: {LICENSE_TYPE}
-                * **Engine**: FLUX.2-dev with 4-bit Quantization
-                * **Text Encoder**: Remote cloud-based encoder with local fallback
-                * **Precision**: bfloat16 (optimal quality/speed)
+                * **Engine**: FLUX.2-dev full precision
+                * **Text Encoder**: Built into the FLUX.2 pipeline
+                * **Precision**: float32 (full precision)
                 
                 ### 🎛️ Generation Limits
                 * **Image Dimensions**: 256x256 to 2048x2048 pixels
@@ -1855,11 +1866,11 @@ with gr.Blocks(title=f"{APP_NAME} v{APP_VERSION}") as demo:
                 * **Concurrent Images**: 1-4 per generation
                 
                 ### 🚀 Performance Features
-                * **4-bit Quantization**: Reduced memory usage, faster generation
-                * **Remote Text Encoding**: Cloud-based prompt processing with local fallback
+                * **Full Precision**: Maximizes model fidelity for FLUX.2-dev
+                * **CPU Offload**: Keeps auxiliary components off VRAM when needed
                 * **Memory Optimization**: Automatic CUDA memory management
                 * **Progress Tracking**: Real-time generation updates
-                * **Error Recovery**: Automatic fallback for failed generations
+                * **Strict Model Path**: Fails explicitly if FLUX.2-dev cannot load
                 * **Watermarking**: Professional branding system
                 * **Usage Analytics**: Session tracking and statistics
                 
@@ -1948,7 +1959,7 @@ with gr.Blocks(title=f"{APP_NAME} v{APP_VERSION}") as demo:
     <div class="footer-section">
         <p><strong>{APP_NAME} v{APP_VERSION}</strong> • {LICENSE_TYPE}</p>
         <p>Professional AI Image Generation Platform • Enterprise-Grade Quality</p>
-        <p><em>Powered by FLUX.2-dev with 4-bit Quantization • Optimized for Commercial Use</em></p>
+        <p><em>Powered by FLUX.2-dev in full precision with CPU offload support • Optimized for Commercial Use</em></p>
     </div>
     """)
 
@@ -2012,6 +2023,7 @@ with gr.Blocks(title=f"{APP_NAME} v{APP_VERSION}") as demo:
             lora_path,
             lora_scale,
             num_images,
+            prompt_upsampling,
             input_image_1,
             input_image_2,
             input_image_3
