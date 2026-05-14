@@ -135,8 +135,8 @@ torch.cuda.empty_cache()
 import gc
 gc.collect()
 
-# Use full precision for FLUX.2 and rely on CPU offload when memory pressure is high
-dtype = torch.float32
+# Use bfloat16 for FLUX.2 (reduces memory footprint by ~50% vs float32) and rely on CPU offload
+dtype = torch.bfloat16
 device = "cuda" if torch.cuda.is_available() else "cpu"
 USE_CPU_OFFLOAD = True
 MAX_VLM_IMAGES = 3
