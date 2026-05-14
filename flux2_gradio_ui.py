@@ -361,8 +361,8 @@ def validate_generation_params(width: int, height: int, steps: int, guidance_sca
     if width % 64 != 0 or height % 64 != 0:
         return False, "Image dimensions must be divisible by 64"
     
-    if steps < 10 or steps > 150:
-        return False, "Steps must be between 10 and 150"
+    if steps < 1:
+        return False, "Steps must be at least 1"
     
     if guidance_scale < 1.0 or guidance_scale > 20.0:
         return False, "Guidance scale must be between 1.0 and 20.0"
@@ -1558,7 +1558,7 @@ with gr.Blocks(title=f"{APP_NAME} v{APP_VERSION}") as demo:
                     lora_scale = gr.Slider(
                         label="🎛️ Style Strength", 
                         minimum=0, 
-                        maximum=3.0, 
+                        maximum=100.0, 
                         value=0.8, 
                         step=0.05,
                         info="Higher values = stronger style influence"
@@ -1677,7 +1677,7 @@ with gr.Blocks(title=f"{APP_NAME} v{APP_VERSION}") as demo:
                 batch_lora_scale = gr.Slider(
                     label="LoRA Scale for Batch", 
                     minimum=0, 
-                    maximum=3.0, 
+                    maximum=100.0, 
                     value=0.8, 
                     step=0.05
                 )
@@ -1693,7 +1693,7 @@ with gr.Blocks(title=f"{APP_NAME} v{APP_VERSION}") as demo:
                     batch_height = gr.Slider(label="Height", minimum=384, maximum=2700, value=512, step=64)
                 
                 with gr.Row():
-                    batch_steps = gr.Slider(label="Steps", minimum=15, maximum=300, value=45, step=1)
+                    batch_steps = gr.Slider(label="Steps", minimum=15, maximum=1000, value=45, step=1)
                     batch_guidance_scale = gr.Slider(label="Guidance Scale", minimum=1, maximum=8, value=3.5, step=0.1)
                 
             with gr.Column(scale=1):
